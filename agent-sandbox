@@ -1,0 +1,841 @@
+#!/usr/bin/env bash
+#
+# agent-sandbox - run an unattended CLI agent inside a systemd user sandbox.
+#
+# Copyright 2026 Archbotics Oy
+# SPDX-License-Identifier: Apache-2.0
+#
+# The walls here are kernel mount namespaces set up by systemd for one
+# transient unit: ProtectSystem=strict, ProtectHome=read-only, an explicit
+# ReadWritePaths allowlist, InaccessiblePaths for credential directories, an
+# optional private tmpfs over $HOME, and a wall clock (RuntimeMaxSec).
+#
+# The user service manager's own sockets are hidden by default. Without that,
+# a confined process can ask the manager for a second, unconfined unit and do
+# everything the sandbox denies; see --allow-user-bus and the README.
+#
+# `--probe` runs a self-test inside the same unit settings and asserts each
+# wall, including that the manager is out of reach. Run it before you trust a
+# profile. A sandbox nobody tested is a belief.
+
+set -euo pipefail
+
+VERSION=0.2.0
+SELF=${0##*/}
+
+# --- helpers ----------------------------------------------------------------
+
+die() { printf '%s: %s\n' "$SELF" "$*" >&2; exit 2; }
+warn() { printf '%s: warning: %s\n' "$SELF" "$*" >&2; }
+
+usage() {
+  cat <<EOF
+usage: $SELF [options] -- <command> [args...]
+       $SELF [options] --probe
+       $SELF [options] --dry-run -- <command> [args...]
+
+Run <command> in a transient systemd user unit whose filesystem access is
+bounded by the kernel.
+
+options:
+  --profile FILE      load defaults from FILE (plain KEY=value, bash-sourced)
+  --cwd DIR           working directory for the run (default: current directory)
+  --rw PATH           writable path (repeatable). Everything else is read-only.
+  --ro PATH           force PATH read-only, even inside a --rw tree (repeatable)
+  --hide PATH         make PATH's contents unreachable, not merely unwritable
+                      (repeatable). A leading "-" tolerates a missing path.
+  --tmpfs-home        replace \$HOME with a private empty tmpfs; --rw and --ro
+                      paths under \$HOME are bound back into it
+  --strict            add NoNewPrivileges, ProtectKernelTunables,
+                      RestrictSUIDSGID, ProtectProc=invisible, and an empty
+                      tmpfs over \$XDG_RUNTIME_DIR (hides agent sockets)
+  --allow-user-bus    do NOT hide the service manager's sockets. The run can
+                      then start unconfined units: an opt-out of the sandbox.
+  --max-runtime SPEC  wall clock for the run, systemd time span (default: 6h,
+                      "infinity" disables it)
+  --env KEY=VALUE     set an environment variable in the unit (repeatable)
+  --property K=V      pass an extra systemd property through (repeatable)
+  --unit-name NAME    transient unit name (default: agent-sandbox-<cwd>-<stamp>)
+  --no-private-tmp    share the host /tmp instead of a private one
+  --private-tmp, --no-tmpfs-home, --no-strict
+                      inverses, for overriding a profile on the command line
+  --dry-run           print the systemd-run command line on stdout, run nothing
+  --probe             run the confinement self-test instead of a command
+  -h, --help          this text
+  --version           print version
+
+The command after -- is required unless --probe is used or the profile
+defines COMMAND.
+
+profile keys (all optional): CWD, RW, RO, HIDE, TMPFS_HOME, PRIVATE_TMP,
+STRICT, ALLOW_USER_BUS, MAX_RUNTIME, SETENV, PROPERTIES, UNIT_NAME, COMMAND.
+List keys accept a bash array or a whitespace separated string. Flags add to
+the profile's lists and override its scalars.
+EOF
+}
+
+# norm PATH -> absolute and normalized: "." and ".." collapsed, "//" reduced,
+# trailing slash stripped. Without this, --rw "$dir/../.." reaches systemd
+# verbatim and widens the allowlist two levels up while every guard below,
+# which compares path strings, sees a path that looks contained. A leading "-"
+# (systemd's tolerate-missing marker) is preserved.
+norm() {
+  local p=$1 dash="" out
+  [ -n "$p" ] || die "an empty path is not a path"
+  case $p in -*) dash="-"; p=${p#-} ;; esac
+  case $p in /*) ;; *) p="$PWD/$p" ;; esac
+  if out=$(realpath -m -- "$p" 2>/dev/null) && [ -n "$out" ]; then
+    printf '%s%s' "$dash" "$out"
+    return 0
+  fi
+  # Lexical fallback for a system without realpath.
+  local part result=""
+  local IFS=/
+  for part in $p; do
+    case $part in
+      ""|.) ;;
+      ..) result=${result%/*} ;;
+      *) result="$result/$part" ;;
+    esac
+  done
+  printf '%s%s' "$dash" "${result:-/}"
+}
+
+# load_list PROFILE_VAR TARGET_ARRAY - accept either an array or a
+# whitespace separated string from the sourced profile.
+load_list() {
+  local _src=$1 _decl
+  local -n _dst=$2
+  _decl=$(declare -p "$_src" 2>/dev/null) || return 0
+  if [[ $_decl == "declare -a"* ]]; then
+    local -n _arr=$_src
+    [ ${#_arr[@]} -eq 0 ] || _dst+=("${_arr[@]}")
+  else
+    local -n _str=$_src
+    [ -n "$_str" ] || return 0
+    local _w
+    # shellcheck disable=SC2206 # word splitting is the documented behaviour
+    local _words=( $_str )
+    for _w in "${_words[@]}"; do _dst+=("$_w"); done
+  fi
+}
+
+# esc_dollar ARG - systemd substitutes ${VARIABLE} in a unit command line
+# before the process ever sees it, and an unset name becomes the empty string.
+# "$$" is systemd's escape for a literal "$", so doubling every dollar makes
+# the argument arrive exactly as it was typed. Verified on systemd 261:
+# "${budget}" arrives empty without this, "$${budget}" arrives intact.
+esc_dollar() { printf '%s' "${1//\$/\$\$}"; }
+
+# is_under CHILD PARENT - both sides must already be normalized.
+is_under() {
+  case $1 in "$2"|"$2"/*) return 0 ;; *) return 1 ;; esac
+}
+
+# sd_prop NAME VALUE - one systemd property; quote values with whitespace so
+# systemd's parser keeps them as a single list entry.
+sd_prop() {
+  local name=$1 value=$2
+  case $value in
+    *[$'\n"\\']*) die "path or value contains a quote, backslash or newline, which this launcher will not encode: $value" ;;
+    *[[:space:]]*) sd+=( --property="$name=\"$value\"" ) ;;
+    *) sd+=( --property="$name=$value" ) ;;
+  esac
+}
+
+# --- defaults ---------------------------------------------------------------
+
+opt_cwd=""
+opt_max_runtime="6h"
+opt_tmpfs_home=0
+opt_private_tmp=1
+opt_strict=0
+opt_allow_bus=0
+opt_unit=""
+opt_dry_run=0
+opt_probe=0
+rw_paths=(); ro_paths=(); hide_paths=(); env_vars=(); extra_props=(); cmd=()
+
+# --- profile (pre-scanned so flags can override it) -------------------------
+
+profile=""
+_args=("$@")
+for ((_i = 0; _i < ${#_args[@]}; _i++)); do
+  case ${_args[_i]} in
+    --) break ;;
+    --profile) profile=${_args[_i + 1]:-} ;;
+    --profile=*) profile=${_args[_i]#--profile=} ;;
+  esac
+done
+
+if [ -n "$profile" ]; then
+  [ -r "$profile" ] || die "profile not readable: $profile"
+  # The profile is bash-sourced: it is configuration you own, not untrusted
+  # input. Anything it can do, the shell that launched this could do anyway.
+  # shellcheck disable=SC1090
+  . "$profile"
+  [ -n "${CWD:-}" ] && opt_cwd=$CWD
+  [ -n "${MAX_RUNTIME:-}" ] && opt_max_runtime=$MAX_RUNTIME
+  [ -n "${UNIT_NAME:-}" ] && opt_unit=$UNIT_NAME
+  [ "${TMPFS_HOME:-0}" = 1 ] && opt_tmpfs_home=1
+  [ "${PRIVATE_TMP:-1}" = 0 ] && opt_private_tmp=0
+  [ "${STRICT:-0}" = 1 ] && opt_strict=1
+  [ "${ALLOW_USER_BUS:-0}" = 1 ] && opt_allow_bus=1
+  # A COMMAND given as a string is word split, which turns a quoted prompt into
+  # several argv entries with the quote characters still in them. Catch the
+  # likely version of that mistake rather than running a mangled command line.
+  if [ -n "${COMMAND+set}" ] && [[ $(declare -p COMMAND) != "declare -a"* ]]; then
+    case $COMMAND in
+      *[\'\"]*) die "profile COMMAND contains a quote character. A string COMMAND is split on whitespace, so use the array form: COMMAND=( my-agent -p \"one argument\" )" ;;
+    esac
+  fi
+  load_list RW rw_paths
+  load_list RO ro_paths
+  load_list HIDE hide_paths
+  load_list SETENV env_vars
+  load_list PROPERTIES extra_props
+  load_list COMMAND cmd
+fi
+
+# --- flags ------------------------------------------------------------------
+
+need() { [ $# -ge 2 ] || die "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    --version) printf '%s %s\n' "$SELF" "$VERSION"; exit 0 ;;
+    --profile) need "$@"; shift 2 ;;
+    --profile=*) shift ;;
+    --cwd) need "$@"; opt_cwd=$2; shift 2 ;;
+    --cwd=*) opt_cwd=${1#--cwd=}; shift ;;
+    --rw) need "$@"; rw_paths+=("$2"); shift 2 ;;
+    --rw=*) rw_paths+=("${1#--rw=}"); shift ;;
+    --ro) need "$@"; ro_paths+=("$2"); shift 2 ;;
+    --ro=*) ro_paths+=("${1#--ro=}"); shift ;;
+    --hide) need "$@"; hide_paths+=("$2"); shift 2 ;;
+    --hide=*) hide_paths+=("${1#--hide=}"); shift ;;
+    --env) need "$@"; env_vars+=("$2"); shift 2 ;;
+    --env=*) env_vars+=("${1#--env=}"); shift ;;
+    --property) need "$@"; extra_props+=("$2"); shift 2 ;;
+    --property=*) extra_props+=("${1#--property=}"); shift ;;
+    --unit-name) need "$@"; opt_unit=$2; shift 2 ;;
+    --unit-name=*) opt_unit=${1#--unit-name=}; shift ;;
+    --max-runtime) need "$@"; opt_max_runtime=$2; shift 2 ;;
+    --max-runtime=*) opt_max_runtime=${1#--max-runtime=}; shift ;;
+    --tmpfs-home) opt_tmpfs_home=1; shift ;;
+    --no-tmpfs-home) opt_tmpfs_home=0; shift ;;
+    --private-tmp) opt_private_tmp=1; shift ;;
+    --no-private-tmp) opt_private_tmp=0; shift ;;
+    --strict) opt_strict=1; shift ;;
+    --no-strict) opt_strict=0; shift ;;
+    --allow-user-bus) opt_allow_bus=1; shift ;;
+    --dry-run) opt_dry_run=1; shift ;;
+    --probe) opt_probe=1; shift ;;
+    --) shift; cmd=("$@"); break ;;
+    -*) die "unknown option: $1 (see --help)" ;;
+    *) die "unexpected argument: $1 (the command goes after --)" ;;
+  esac
+done
+
+# --- validation -------------------------------------------------------------
+
+[ -n "${HOME:-}" ] || die "HOME is not set"
+[ -n "$opt_max_runtime" ] || die "--max-runtime needs a value"
+
+uid=$(id -u)
+runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$uid}
+home=$(norm "$HOME")
+
+opt_cwd=$(norm "${opt_cwd:-$PWD}")
+[ -d "$opt_cwd" ] || die "--cwd is not a directory: $opt_cwd"
+
+check_path() {
+  local p=$1 what=$2
+  case $p in -*) return 0 ;; esac  # caller asked systemd to tolerate a missing path
+  [ -e "$p" ] || die "$what path does not exist: $p (create it, or prefix it with '-' to let systemd skip it)"
+}
+
+for _i in "${!rw_paths[@]}"; do
+  rw_paths[_i]=$(norm "${rw_paths[_i]}")
+  check_path "${rw_paths[_i]}" "--rw"
+  # A writable / or $HOME is not a sandbox, and it also removes the probe's
+  # only witness that anything in $HOME was bounded at all.
+  case ${rw_paths[_i]#-} in
+    /) die "--rw / makes the whole filesystem writable, which is the opposite of this tool" ;;
+    "$home") die "--rw \$HOME makes the entire home writable. Name the directories the run needs instead." ;;
+  esac
+done
+for _i in "${!ro_paths[@]}"; do
+  ro_paths[_i]=$(norm "${ro_paths[_i]}")
+  check_path "${ro_paths[_i]}" "--ro"
+done
+for _i in "${!hide_paths[@]}"; do
+  hide_paths[_i]=$(norm "${hide_paths[_i]}")
+  check_path "${hide_paths[_i]}" "--hide"
+done
+for _kv in ${env_vars[@]+"${env_vars[@]}"}; do
+  [[ $_kv == [A-Za-z_]*=* ]] || die "--env expects KEY=VALUE, got: $_kv"
+done
+for _kv in ${extra_props[@]+"${extra_props[@]}"}; do
+  [[ $_kv == *=* ]] || die "--property expects NAME=VALUE, got: $_kv"
+done
+
+if [ $opt_tmpfs_home -eq 1 ]; then
+  for _p in ${rw_paths[@]+"${rw_paths[@]}"}; do
+    [ "${_p#-}" = "$home" ] && die "--tmpfs-home with --rw \$HOME is a contradiction: drop one"
+  done
+fi
+
+if [ $opt_probe -eq 0 ] && [ ${#cmd[@]} -eq 0 ]; then
+  die "no command: put it after -- , or define COMMAND in the profile, or use --probe"
+fi
+
+# PrivateTmp=yes replaces /tmp and /var/tmp with empty private ones, so any
+# path there is not in the namespace and the unit dies with 226/NAMESPACE.
+# Say so here rather than letting systemd fail with a bare ENOENT, and do not
+# quietly drop the private /tmp: that would weaken the sandbox behind the
+# operator's back.
+if [ $opt_private_tmp -eq 1 ]; then
+  for _p in "$opt_cwd" ${rw_paths[@]+"${rw_paths[@]}"} ${ro_paths[@]+"${ro_paths[@]}"} ${hide_paths[@]+"${hide_paths[@]}"}; do
+    _p=${_p#-}
+    if is_under "$_p" /tmp || is_under "$_p" /var/tmp; then
+      die "$_p is under a private /tmp, which the unit replaces with an empty one. Pass --no-private-tmp to share the host /tmp, or move the path out of /tmp."
+    fi
+  done
+fi
+
+# The launcher appends nothing to the unit name, so a name that already carries
+# a suffix would produce "my-lane.service.service" and every later lookup of
+# "my-lane.service" would read a unit that does not exist. systemctl answers
+# for a missing unit with property defaults rather than an error, so that
+# mistake shows up as a wrong probe result, not as an error.
+case $opt_unit in
+  *.service) opt_unit=${opt_unit%.service} ;;
+  *.timer|*.socket|*.target|*.mount|*.path|*.slice|*.scope)
+    die "--unit-name must be a plain name or end in .service, got: $opt_unit" ;;
+esac
+if [ -z "$opt_unit" ]; then
+  _tag=${opt_cwd##*/}
+  _tag=${_tag//[^A-Za-z0-9_.]/-}
+  [ -n "$_tag" ] || _tag=run
+  opt_unit="agent-sandbox-$_tag-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+[[ $opt_unit =~ ^[A-Za-z0-9:_.-]+$ ]] || die "--unit-name may only use letters, digits and : _ . -"
+
+# --- build the systemd-run command ------------------------------------------
+
+sd=(
+  systemd-run --user --pipe --collect
+  --unit="$opt_unit"
+  --working-directory="$opt_cwd"
+  --property=ProtectSystem=strict
+  --property=ProtectHome=read-only
+)
+[ $opt_private_tmp -eq 1 ] && sd+=( --property=PrivateTmp=yes )
+
+# The service manager's own sockets. A confined process that can reach these
+# can ask the manager to start a second unit with no sandboxing at all, which
+# makes every wall below advisory. The "-" prefixes tolerate a machine with no
+# runtime directory. --allow-user-bus is the deliberate opt-out.
+if [ $opt_allow_bus -eq 0 ]; then
+  sd_prop InaccessiblePaths "-$runtime_dir/bus"
+  sd_prop InaccessiblePaths "-$runtime_dir/systemd"
+fi
+
+# --strict: hardening that costs something, so it is opt-in.
+# ProtectProc=invisible is included for completeness and has no effect on user
+# units (systemd documents it for system services); the probe measures the
+# result rather than trusting the directive.
+if [ $opt_strict -eq 1 ]; then
+  sd+=( --property=NoNewPrivileges=yes )
+  sd+=( --property=ProtectKernelTunables=yes )
+  sd+=( --property=RestrictSUIDSGID=yes )
+  sd+=( --property=ProtectProc=invisible )
+  sd_prop TemporaryFileSystem "$runtime_dir:mode=0700"
+fi
+
+# Paths under $HOME need different directives once $HOME is a tmpfs: the real
+# path is gone from the namespace, so ReadWritePaths/ReadOnlyPaths on it fail
+# the unit with 226/NAMESPACE. BindPaths/BindReadOnlyPaths mount the real
+# directory back into the tmpfs at the same location, which is both the
+# bind-back and the write permission.
+probe_rw=()
+if [ $opt_tmpfs_home -eq 1 ]; then
+  sd_prop TemporaryFileSystem "$home:mode=0700"
+  bound=()
+  for _p in ${rw_paths[@]+"${rw_paths[@]}"}; do
+    if is_under "${_p#-}" "$home"; then
+      sd_prop BindPaths "$_p"; bound+=("${_p#-}")
+    else
+      sd_prop ReadWritePaths "$_p"
+    fi
+    probe_rw+=("${_p#-}")
+  done
+  for _p in ${ro_paths[@]+"${ro_paths[@]}"}; do
+    if is_under "${_p#-}" "$home"; then
+      sd_prop BindReadOnlyPaths "$_p"; bound+=("${_p#-}")
+    else
+      sd_prop ReadOnlyPaths "$_p"
+    fi
+  done
+  # A --hide path under $HOME is already gone with the real home. Keep it in
+  # the list for the probe, but let systemd tolerate its absence, otherwise
+  # the unit refuses to start.
+  for _p in ${hide_paths[@]+"${hide_paths[@]}"}; do
+    if is_under "${_p#-}" "$home"; then sd_prop InaccessiblePaths "-${_p#-}"
+    else sd_prop InaccessiblePaths "$_p"; fi
+  done
+  # The working directory has to exist inside the namespace too.
+  _covered=0
+  for _b in ${bound[@]+"${bound[@]}"}; do
+    is_under "$opt_cwd" "$_b" && _covered=1 && break
+  done
+  if [ $_covered -eq 0 ] && is_under "$opt_cwd" "$home"; then
+    sd_prop BindReadOnlyPaths "$opt_cwd"
+  fi
+else
+  for _p in ${rw_paths[@]+"${rw_paths[@]}"}; do sd_prop ReadWritePaths "$_p"; probe_rw+=("${_p#-}"); done
+  for _p in ${ro_paths[@]+"${ro_paths[@]}"}; do sd_prop ReadOnlyPaths "$_p"; done
+  for _p in ${hide_paths[@]+"${hide_paths[@]}"}; do sd_prop InaccessiblePaths "$_p"; done
+fi
+
+case $opt_max_runtime in
+  infinity|0) ;;  # explicitly no wall clock; --probe reports it as skipped
+  *) sd+=( --property="RuntimeMaxSec=$opt_max_runtime" ) ;;
+esac
+
+for _kv in ${env_vars[@]+"${env_vars[@]}"}; do sd+=( --setenv="$_kv" ); done
+for _kv in ${extra_props[@]+"${extra_props[@]}"}; do sd+=( --property="$_kv" ); done
+
+# --- the probe payload (runs inside the unit) -------------------------------
+# Assertions are indexed environment variables rather than one packed string so
+# that paths containing spaces survive. Three verdicts: PASS, FAIL, and SKIP
+# for a wall that was deliberately not asked for or cannot be tested here. A
+# skipped check is never silent and never counts as green: the exit status is
+# 0 for all-pass, 2 for pass-with-skips, 1 for any failure.
+read -r -d '' PROBE_SCRIPT <<'PROBE_EOF' || true
+set -u
+fail=0
+skipped=0
+passed=0
+pass() { printf 'PASS: %s\n' "$1"; passed=$((passed + 1)); }
+bad()  { printf 'FAIL: %s\n' "$1"; fail=1; }
+skip() { printf 'SKIP: %s\n' "$1"; skipped=$((skipped + 1)); }
+marker=".agent-sandbox-probe.$$"
+tmpfs_marker="$HOME/.agent-sandbox-tmpfs-marker"
+created=()
+cleanup() { local f; for f in ${created[@]+"${created[@]}"}; do rm -f "$f" 2>/dev/null || true; done; }
+trap cleanup EXIT
+
+get() { local n="$1_$2"; printf '%s' "${!n-}"; }
+
+# The options of the mount that actually covers a path: the longest mount point
+# that is a prefix of it, last entry winning. "Can I write this file" is not the
+# same question as "is this wall standing" (an unprivileged user cannot write
+# /etc on any machine, sandbox or not), so the walls are read from the kernel's
+# mount table instead.
+mount_opts_for() {
+  awk -v target="$1" '
+    { mp = $5
+      if (mp == "/" || mp == target || index(target, mp "/") == 1) {
+        if (length(mp) >= best) { best = length(mp); opts = $6 }
+      }
+    }
+    END { print opts }' /proc/self/mountinfo
+}
+mount_is_ro() { case ",$(mount_opts_for "$1")," in *,ro,*) return 0 ;; esac; return 1; }
+
+phase2() {
+  # Second run of the same profile: the tmpfs must not have kept anything.
+  if [ -e "$tmpfs_marker" ]; then
+    bad "tmpfs home does not persist: a marker written by the previous run is still there"
+    rm -f "$tmpfs_marker" 2>/dev/null || true
+  else
+    pass "tmpfs home does not persist: the previous run's marker is gone"
+  fi
+}
+
+phase1() {
+  # This header is the payload's proof of life: the launcher refuses to print a
+  # green verdict unless it saw this line and the completion line at the end.
+  echo "=== agent-sandbox --probe: assertions run inside the unit ==="
+
+  # --- 1. the allowlist -------------------------------------------------------
+  n=${AS_RW_N:-0}; i=0
+  while [ "$i" -lt "$n" ]; do
+    p=$(get AS_RW "$i")
+    if ( : > "$p/$marker" ) 2>/dev/null; then
+      created+=("$p/$marker")
+      pass "writable as allowed: $p"
+    else
+      bad "should be writable but is not: $p"
+    fi
+    i=$((i + 1))
+  done
+  [ "$n" -gt 0 ] || echo "note: no --rw paths configured, so the run can write nothing outside a private /tmp"
+
+  # --- 2. home ----------------------------------------------------------------
+  if [ "${AS_TMPFS_HOME:-0}" = 1 ]; then
+    if [ "$(stat -f -c %T "$HOME" 2>/dev/null)" = "tmpfs" ]; then
+      pass "\$HOME is a private tmpfs, the real home is not in this namespace"
+    else
+      bad "\$HOME is not a tmpfs, --tmpfs-home did not take effect"
+    fi
+    if ( : > "$tmpfs_marker" ) 2>/dev/null; then
+      pass "tmpfs home is writable (non-persistence is checked by the second run below)"
+    else
+      bad "tmpfs home is not writable"
+    fi
+  elif [ -n "${AS_DENY_PATH:-}" ]; then
+    if ( : > "$AS_DENY_PATH" ) 2>/dev/null; then
+      created+=("$AS_DENY_PATH")
+      bad "home is writable outside the allowlist: wrote $AS_DENY_PATH"
+    else
+      pass "home outside the allowlist is not writable: $AS_DENY_PATH"
+    fi
+  else
+    skip "home denial untested: an --rw path covers the witness location, so nothing proves \$HOME was bounded"
+  fi
+
+  # --- 3. the rest of the filesystem ------------------------------------------
+  if mount_is_ro /; then
+    pass "/ is mounted read-only inside the unit (ProtectSystem=strict)"
+  else
+    bad "/ is not read-only inside the unit: mount options are $(mount_opts_for /)"
+  fi
+  if mount_is_ro /etc; then
+    pass "/etc is on a read-only mount"
+  else
+    bad "/etc is on a writable mount: $(mount_opts_for /etc)"
+  fi
+
+  # --- 4. read-only carve-outs ------------------------------------------------
+  n=${AS_RO_N:-0}; i=0
+  while [ "$i" -lt "$n" ]; do
+    p=$(get AS_RO "$i")
+    if mount_is_ro "$p"; then
+      pass "read-only as asked: $p"
+    else
+      bad "should be read-only but its mount is writable: $p ($(mount_opts_for "$p"))"
+    fi
+    i=$((i + 1))
+  done
+
+  # --- 5. hidden paths --------------------------------------------------------
+  # InaccessiblePaths leaves the name in place as an empty node with mode 000, so
+  # the assertion reads through it rather than stating it. A path that is not
+  # there at all is reported separately: that is what a typo looks like.
+  n=${AS_HIDE_N:-0}; i=0
+  while [ "$i" -lt "$n" ]; do
+    p=$(get AS_HIDE "$i")
+    err=$(ls -A "$p" 2>&1 >/dev/null) || true
+    if ls -A "$p" >/dev/null 2>&1 || head -c 1 "$p" >/dev/null 2>&1; then
+      bad "should be hidden but its contents are readable: $p"
+    elif [ -e "$p" ] || [ -L "$p" ]; then
+      pass "hidden: $p (${err##*: })"
+    elif [ "${AS_TMPFS_HOME:-0}" = 1 ] && case $p in "$HOME"/*) true ;; *) false ;; esac; then
+      pass "hidden: $p (removed with the real home by --tmpfs-home)"
+    else
+      skip "nothing exists at $p inside the unit, so the hidden wall was not tested (a typo looks exactly like this)"
+    fi
+    i=$((i + 1))
+  done
+
+  # --- 6. private /tmp --------------------------------------------------------
+  if [ "${AS_PRIVATE_TMP:-0}" = 1 ]; then
+    if [ -n "${AS_TMP_WITNESS:-}" ] && [ -e "$AS_TMP_WITNESS" ]; then
+      bad "/tmp is shared: a file created outside the unit is visible at $AS_TMP_WITNESS"
+    else
+      pass "/tmp is private: files outside the unit are not visible in it"
+    fi
+  fi
+
+  # --- 7. the hostile occupant ------------------------------------------------
+  # Everything above assumes the run stays inside its namespace. These check that
+  # it cannot step outside by asking someone else to act for it.
+  rt=${AS_RUNTIME_DIR:-}
+  if [ "${AS_ALLOW_BUS:-0}" = 1 ]; then
+    skip "the service manager's sockets are reachable by request (--allow-user-bus): the run can start an unconfined unit and undo every wall above"
+  else
+    # Opening a socket with a shell redirect fails with ENXIO even when it is
+    # permitted, so that is not a usable test. connect(2) needs write permission
+    # on the socket node, which is exactly what InaccessiblePaths removes.
+    if [ -z "$rt" ] || [ ! -d "$rt" ]; then
+      skip "no runtime directory at ${rt:-\$XDG_RUNTIME_DIR} inside the unit, so the bus wall was not tested here: a launcher pointed at the wrong runtime directory looks exactly like a wall (the unit-start attempt below is the check that still holds)"
+    elif [ -w "$rt/bus" ]; then
+      bad "the user bus at $rt/bus is connectable"
+    else
+      pass "the user bus is not connectable"
+    fi
+    if command -v systemd-run >/dev/null 2>&1; then
+      if systemd-run --user --collect --pipe --quiet -- true >/dev/null 2>&1; then
+        bad "an unconfined unit CAN be started from inside the sandbox: every wall above is advisory"
+      else
+        pass "no unit can be started from inside the sandbox"
+      fi
+    else
+      skip "systemd-run is not on PATH inside the unit, so 'can the run start its own unit' was not tested"
+    fi
+  fi
+
+  # Sockets under the runtime directory belong to processes that are already
+  # holding credentials: gpg-agent, ssh-agent, the login keyring. Hiding a
+  # credential directory does not disconnect them.
+  if [ -z "$rt" ] || [ ! -d "$rt" ]; then
+    skip "there is no runtime directory at ${rt:-\$XDG_RUNTIME_DIR} inside the unit, so nothing was enumerated: absent is not the same as blocked"
+  else
+    # Only entries that are still openable count: a hidden node stays in the
+    # listing with mode 000, and reporting it as reachable would contradict the
+    # assertion two lines up.
+    socks=""
+    for e in "$rt"/*; do
+      [ -e "$e" ] || continue
+      if [ -r "$e" ] || [ -w "$e" ]; then socks="$socks ${e##*/}"; fi
+    done
+    if [ -z "$socks" ]; then
+      pass "nothing under $rt is reachable"
+    else
+      skip "these entries under $rt are still reachable, and the processes behind them hold credentials of their own:${socks}"
+    fi
+  fi
+
+  # Processes of the same user are visible and, subject to ptrace_scope, are a
+  # route around the filesystem walls. Measured, not assumed.
+  foreign=0
+  for pp in /proc/[0-9]*; do
+    o=$(stat -c %u "$pp" 2>/dev/null) || continue
+    [ "$o" = "${AS_UID:-x}" ] || foreign=$((foreign + 1))
+  done
+  if [ "$foreign" -eq 0 ]; then
+    pass "no processes of other users are visible in /proc"
+  else
+    skip "$foreign processes of other users are visible in /proc (ProtectProc= has no effect on user units); ptrace_scope=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+  fi
+
+  # --- 8. --strict extras -----------------------------------------------------
+  if [ "${AS_STRICT:-0}" = 1 ]; then
+    if grep -q '^NoNewPrivs:[[:space:]]*1' /proc/self/status; then
+      pass "NoNewPrivileges is set: setuid binaries cannot raise privileges"
+    else
+      bad "NoNewPrivileges is not set"
+    fi
+    if mount_is_ro /proc/sys; then
+      pass "/proc/sys is read-only (ProtectKernelTunables)"
+    else
+      bad "/proc/sys is not read-only: kernel tunables are reachable"
+    fi
+    if [ "${AS_RW_N:-0}" -gt 0 ]; then
+      sp="$(get AS_RW 0)/$marker.suid"
+      if ( : > "$sp" ) 2>/dev/null; then
+        created+=("$sp")
+        if chmod u+s "$sp" 2>/dev/null; then
+          bad "a setuid bit can be set inside the sandbox (RestrictSUIDSGID)"
+        else
+          pass "setting a setuid bit is refused (RestrictSUIDSGID)"
+        fi
+      else
+        skip "no writable path to test RestrictSUIDSGID in"
+      fi
+    else
+      skip "no --rw path, so RestrictSUIDSGID was not tested"
+    fi
+  fi
+
+  # --- 9. am I the unit I was told I am ---------------------------------------
+  if [ -n "${AS_UNIT:-}" ]; then
+    cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null)
+    case $cg in
+      */"$AS_UNIT") pass "running inside $AS_UNIT (checked against /proc/self/cgroup)" ;;
+      "") skip "no cgroup path in /proc/self/cgroup, so the unit identity was not checked" ;;
+      *) bad "expected to be in $AS_UNIT but the cgroup says $cg" ;;
+    esac
+  fi
+}
+
+# The payload arrives on stdin through a pipe, so it must run to its last line:
+# an early exit leaves the decoder writing into a closed pipe and printing an
+# error of its own on top of the results.
+if [ "${AS_PHASE:-1}" = 2 ]; then phase2; else phase1; fi
+
+# The launcher greps for this line. A payload that never ran, or died halfway,
+# cannot produce it, and a verdict is then refused rather than assumed.
+printf '=== payload complete: %s passed, %s failed, %s skipped inside the unit ===\n' \
+  "$passed" "$fail" "$skipped"
+
+if [ "$fail" -ne 0 ]; then exit 1; fi
+if [ "$skipped" -ne 0 ]; then exit 2; fi
+exit 0
+PROBE_EOF
+
+# --- assemble ---------------------------------------------------------------
+
+run=()
+witness=""
+if [ $opt_probe -eq 1 ]; then
+  sd+=( --setenv="AS_UNIT=$opt_unit.service" )
+  sd+=( --setenv="AS_TMPFS_HOME=$opt_tmpfs_home" )
+  sd+=( --setenv="AS_PRIVATE_TMP=$opt_private_tmp" )
+  sd+=( --setenv="AS_STRICT=$opt_strict" )
+  sd+=( --setenv="AS_ALLOW_BUS=$opt_allow_bus" )
+  sd+=( --setenv="AS_RUNTIME_DIR=$runtime_dir" )
+  sd+=( --setenv="AS_UID=$uid" )
+  sd+=( --setenv="AS_RW_N=${#probe_rw[@]}" )
+  _i=0; for _p in ${probe_rw[@]+"${probe_rw[@]}"}; do sd+=( --setenv="AS_RW_$_i=$_p" ); _i=$((_i + 1)); done
+  sd+=( --setenv="AS_RO_N=${#ro_paths[@]}" )
+  _i=0; for _p in ${ro_paths[@]+"${ro_paths[@]}"}; do sd+=( --setenv="AS_RO_$_i=${_p#-}" ); _i=$((_i + 1)); done
+  sd+=( --setenv="AS_HIDE_N=${#hide_paths[@]}" )
+  _i=0; for _p in ${hide_paths[@]+"${hide_paths[@]}"}; do sd+=( --setenv="AS_HIDE_$_i=${_p#-}" ); _i=$((_i + 1)); done
+  # The denial witness: a path in $HOME that no --rw covers. --rw $HOME is
+  # refused above, so this normally exists; if it does not, the probe says so
+  # in a SKIP line rather than passing quietly.
+  deny="$home/.agent-sandbox-probe-should-fail"
+  for _p in ${probe_rw[@]+"${probe_rw[@]}"}; do
+    is_under "$deny" "$_p" && deny="" && break
+  done
+  sd+=( --setenv="AS_DENY_PATH=$deny" )
+  # A witness file created outside the unit: with PrivateTmp=yes the unit must
+  # not see it. Created just before the run, below, so --dry-run writes nothing.
+  if [ $opt_private_tmp -eq 1 ]; then
+    witness="/tmp/.agent-sandbox-tmp-witness.$$"
+    sd+=( --setenv="AS_TMP_WITNESS=$witness" )
+  fi
+  # The payload travels base64 encoded: an inline script would be chewed by
+  # the same ${...} substitution esc_dollar() exists for, and by systemd's
+  # quote handling on top of it. Base64 has no character systemd touches.
+  run=( "${sd[@]}" -- bash -c "echo $(printf '%s' "$PROBE_SCRIPT" | base64 -w0) | base64 -d | bash" )
+else
+  _esc=()
+  for _a in "${cmd[@]}"; do _esc+=( "$(esc_dollar "$_a")" ); done
+  run=( "${sd[@]}" -- "${_esc[@]}" )
+fi
+
+if [ $opt_dry_run -eq 1 ]; then
+  printf '# %s --dry-run: unit=%s probe=%s\n' "$SELF" "$opt_unit" "$opt_probe" >&2
+  printf '%q ' "${run[@]}"
+  printf '\n'
+  exit 0
+fi
+
+command -v systemd-run >/dev/null 2>&1 ||
+  die "systemd-run not found. This needs systemd with a user manager: check 'systemctl --user status'."
+
+if [ $opt_probe -eq 0 ]; then
+  case ${cmd[0]} in
+    /*) [ -x "${cmd[0]}" ] || warn "not executable: ${cmd[0]}" ;;
+    *) command -v "${cmd[0]}" >/dev/null 2>&1 ||
+         warn "'${cmd[0]}' is not on this shell's PATH. The unit's PATH comes from the user service manager and is usually /usr/local/bin:/usr/bin, so pass an absolute path or set --env PATH=..." ;;
+  esac
+  exec "${run[@]}"
+fi
+
+# --- probe execution --------------------------------------------------------
+# The wall clock is read on the HOST side, while the unit is alive: with the
+# manager's sockets hidden (the default), the confined payload cannot ask
+# systemd anything, and a value the launcher passed to itself through the
+# environment would assert nothing. Phase 2 re-runs the same settings to prove
+# the tmpfs home kept nothing from phase 1.
+#
+# Every run is captured as well as displayed, because a verdict printed by the
+# launcher alone is a verdict about nothing: if the payload never reached the
+# unit (a missing interpreter, a changed transport), the launcher must say so
+# instead of reporting a green run in which nothing was tested.
+
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ ! -d "$XDG_RUNTIME_DIR" ]; then
+  warn "XDG_RUNTIME_DIR is set to $XDG_RUNTIME_DIR, which is not a directory. The walls over the service manager's sockets will be applied to a path that does not exist, while the unit inherits the manager's real runtime directory. Unset it or point it at the real one."
+fi
+
+probe_log=$(mktemp "${TMPDIR:-/tmp}/agent-sandbox-probe.XXXXXX") ||
+  die "could not create a temporary file to capture the probe output"
+trap 'rm -f "$probe_log" ${witness:+"$witness"}' EXIT
+[ -n "$witness" ] && : > "$witness"
+
+# saw_payload LOGFILE NEED_HEADER - did the payload actually run to its end?
+saw_payload() {
+  local log=$1 need_header=$2
+  if [ "$need_header" = 1 ] && ! grep -q '^=== agent-sandbox --probe: assertions run inside the unit ===$' "$log"; then
+    return 1
+  fi
+  grep -q '^=== payload complete: ' "$log"
+}
+
+status=0
+skips=0
+
+# The unit runs in the foreground so the pipeline status is readable and tee has
+# flushed by the time the log is inspected; the wall-clock poll is what moves to
+# the background.
+wall_file=$(mktemp "${TMPDIR:-/tmp}/agent-sandbox-wall.XXXXXX") || wall_file=""
+(
+  for _ in $(seq 1 200); do
+    if [ "$(systemctl --user show -p LoadState --value "$opt_unit.service" 2>/dev/null)" = "loaded" ]; then
+      w=$(systemctl --user show -p RuntimeMaxUSec --value "$opt_unit.service" 2>/dev/null) || w=""
+      if [ -n "$w" ]; then printf '%s' "$w" > "$wall_file"; break; fi
+    fi
+    sleep 0.05
+  done
+) &
+poll_pid=$!
+
+set +e
+"${run[@]}" | tee "$probe_log"
+status=${PIPESTATUS[0]}
+set -e
+
+kill "$poll_pid" 2>/dev/null || true
+wait "$poll_pid" 2>/dev/null || true
+wall=""
+[ -n "$wall_file" ] && [ -s "$wall_file" ] && wall=$(cat "$wall_file")
+rm -f "$wall_file"
+
+if [ "$status" -eq 2 ]; then skips=1; status=0; fi
+
+if ! saw_payload "$probe_log" 1; then
+  echo "FAIL: the probe payload did not run to completion inside the unit: no completion line in its output, so nothing above was asserted"
+  status=1
+fi
+
+case $opt_max_runtime in
+  infinity|0)
+    echo "SKIP: no wall clock: --max-runtime is $opt_max_runtime, so the run can hang forever"
+    skips=1
+    ;;
+  *)
+    case $wall in
+      "") echo "FAIL: wall clock unverifiable: could not read RuntimeMaxUSec of $opt_unit.service while it ran"; status=1 ;;
+      infinity) echo "FAIL: no wall clock: RuntimeMaxSec on $opt_unit.service is infinity"; status=1 ;;
+      *) echo "PASS: wall clock set on $opt_unit.service: RuntimeMaxSec=$wall (read from the manager, outside the unit)" ;;
+    esac
+    ;;
+esac
+
+if [ $opt_tmpfs_home -eq 1 ] && [ $status -eq 0 ]; then
+  phase2=()
+  for _a in "${run[@]}"; do
+    case $_a in
+      --unit=*) phase2+=( "--unit=$opt_unit-p2" ) ;;
+      *) phase2+=( "$_a" ) ;;
+    esac
+  done
+  phase2=( "${phase2[0]}" --setenv=AS_PHASE=2 "${phase2[@]:1}" )
+  : > "$probe_log"
+  set +e
+  "${phase2[@]}" | tee "$probe_log"
+  p2_status=${PIPESTATUS[0]}
+  set -e
+  [ "$p2_status" -eq 0 ] || status=$p2_status
+  if ! saw_payload "$probe_log" 0; then
+    echo "FAIL: the second-run payload did not run to completion, so tmpfs non-persistence was not tested"
+    status=1
+  fi
+fi
+
+if [ $status -ne 0 ]; then
+  echo "=== agent-sandbox --probe: FAILURES ABOVE, the sandbox is not what the flags claim ==="
+  printf '%s: probe FAILED (exit %s)\n' "$SELF" "$status" >&2
+elif [ "$skips" -ne 0 ]; then
+  echo "=== agent-sandbox --probe: nothing failed, and some checks were SKIPPED above. A skipped check is not a passed check. ==="
+else
+  echo "=== agent-sandbox --probe: all assertions passed ==="
+fi
+exit "$status"

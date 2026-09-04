@@ -1,0 +1,37 @@
+# Example systemd user service: one sandboxed agent run.
+# Documentation only. agent-sandbox installs nothing.
+#
+# Copyright 2026 Archbotics Oy
+# SPDX-License-Identifier: Apache-2.0
+#
+# Install:
+#   cp nightly.service nightly.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now nightly.timer
+#   loginctl enable-linger "$USER"   # user timers run with no login session
+#
+# Check it before enabling:
+#   agent-sandbox --profile %h/lanes/nightly.profile --probe
+
+[Unit]
+Description=Nightly sandboxed agent run
+
+[Service]
+Type=oneshot
+
+# The probe runs first. If a wall is missing, this fails and ExecStart never
+# runs: a broken sandbox stops the lane instead of running it unconfined.
+# The probe exits zero when nothing failed, including when it skipped checks,
+# so read its SKIP lines in the journal at least once before trusting the lane.
+ExecStartPre=%h/.local/bin/agent-sandbox --profile %h/lanes/nightly.profile --probe
+
+ExecStart=%h/.local/bin/agent-sandbox --profile %h/lanes/nightly.profile
+
+# For Type=oneshot this is how long ExecStart may take, and it defaults to
+# DefaultTimeoutStartSec (90s on most systems), which would kill an agent run
+# minutes in. The real clock is MAX_RUNTIME in the profile, enforced by the
+# kernel side as RuntimeMaxSec on the sandboxed unit.
+TimeoutStartSec=infinity
+
+# This unit is a launcher: the confinement belongs to the transient unit that
+# agent-sandbox creates, not to this one.

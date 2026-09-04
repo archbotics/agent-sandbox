@@ -1,0 +1,19 @@
+# Example systemd user timer for nightly.service.
+# Documentation only.
+#
+# Copyright 2026 Archbotics Oy
+# SPDX-License-Identifier: Apache-2.0
+
+[Unit]
+Description=Schedule the nightly sandboxed agent run
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# A missed run (machine asleep or off) fires at the next boot instead of being
+# skipped. Drop this if a late run is worse than no run.
+Persistent=true
+# Keeps several machines, or several lanes, from starting on the same second.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

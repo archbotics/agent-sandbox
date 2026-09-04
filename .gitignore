@@ -1,0 +1,9 @@
+# local profiles: they name your paths, and some name your directories of
+# secrets. Keep them out of the repo.
+*.local.profile
+/local/
+
+# editor and OS noise
+*~
+.*.swp
+.DS_Store
